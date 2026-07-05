@@ -1,0 +1,666 @@
+"""
+ui.py  —  htop-like terminal UI for the system stats collector.
+
+Usage : ./collector | python3 ui.py
+Deps  : pip install rich readchar
+
+Key bindings (NORMAL mode)
+──────────────────────────
+  UP / DOWN        scroll process list one row at a time
+  PAGE UP / DOWN   scroll process list one page at a time
+  HOME / END       jump to top / bottom of list
+
+  1                sort by CPU%    (toggle asc/desc)
+  2                sort by MEM%    (toggle asc/desc)
+  3                sort by PID     (toggle asc/desc)
+  4                sort by PRI     (toggle asc/desc)
+  5                sort by NI      (toggle asc/desc)
+  6                sort by VIRT    (toggle asc/desc)
+  7                sort by RES     (toggle asc/desc)
+  8                sort by SHR     (toggle asc/desc)
+
+  /                enter filter mode  (ESC to cancel, ENTER to apply)
+  s / S            enter search/highlight mode
+  ESC              clear active filter + search
+
+  q / Q / Ctrl-C   quit
+"""
+
+import sys
+import os
+import json
+import threading
+import queue
+import time
+
+from rich.console import Console
+from rich.table   import Table
+from rich.panel   import Panel
+from rich.layout  import Layout
+from rich.live    import Live
+from rich.text    import Text
+
+import readchar
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Duplicate the stdin pipe fd BEFORE sys.stdin is replaced by /dev/tty
+# ─────────────────────────────────────────────────────────────────────────────
+_pipe_fd   = os.dup(sys.stdin.fileno())
+_pipe_file = os.fdopen(_pipe_fd, "r", buffering=1)
+
+console = Console()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED STATE  (all access protected by _lock)
+# ─────────────────────────────────────────────────────────────────────────────
+_lock = threading.Lock()
+
+raw_processes  : list = []
+filtered_procs : list = []
+sorted_procs   : list = []
+system_metrics : dict = None
+
+sort_key       : str  = "cpu_pct"
+sort_reverse   : bool = True
+filter_text    : str  = ""
+search_text    : str  = ""
+ui_mode        : str  = "NORMAL"   # NORMAL | FILTER_INPUT | SEARCH_INPUT
+input_buffer   : str  = ""
+scroll_offset  : int  = 0          # index of first visible row in sorted_procs
+
+stop_event = threading.Event()
+
+# Increased queue sizes to reduce eviction under bursts
+_filter_q = queue.Queue(maxsize=8)
+_sort_q   = queue.Queue(maxsize=8)
+_key_q    = queue.Queue(maxsize=64)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_put(q: queue.Queue, item):
+    """Non-blocking put: evict the oldest item first if the queue is full."""
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            pass
+
+
+def _visible_rows() -> int:
+    """
+    Compute how many process rows actually fit in the terminal right now.
+
+    Layout breakdown (lines):
+      header panel  : size=3   (border top + content + border bottom)
+      top panels    : size=17  (3-panel row for system/cpu/memory)
+      table title   : 1
+      table header  : 1
+      table borders : 2  (top + bottom)
+      status panel  : size=3
+    Total reserved  = 3 + 17 + 4 + 3 = 27
+    """
+    h = console.size.height
+    reserved = 3 + 17 + 4 + 3
+    return max(1, h - reserved)
+
+
+def _clamp_offset(offset: int, total: int, visible: int) -> int:
+    """Keep scroll_offset within [0, max(0, total - visible)]."""
+    return max(0, min(offset, max(0, total - visible)))
+
+
+def _set_scroll(new_offset: int):
+    """
+    Write a clamped scroll_offset back to the global under the lock.
+    Always call this instead of assigning scroll_offset directly so that
+    the global stays consistent with the current list length.
+    """
+    global scroll_offset
+    with _lock:
+        total = len(sorted_procs)
+    visible       = _visible_rows()
+    scroll_offset = _clamp_offset(new_offset, total, visible)
+
+
+def _bar(pct: float, length: int = 25) -> str:
+    pct    = max(0.0, min(100.0, pct))
+    filled = int(pct / 100 * length)
+    color  = "green" if pct < 50 else ("yellow" if pct < 80 else "red")
+    return (f"[{color}]" + "■" * filled +
+            "[grey23]"   + "■" * (length - filled) + "[/grey23]")
+
+
+def _esc_markup(s: str) -> str:
+    """Escape Rich markup brackets so process names never break rendering."""
+    return s.replace("[", "\\[")
+
+
+def _highlight(raw: str, term: str, base: str = "white") -> str:
+    """
+    Return Rich markup string with `term` highlighted inside `raw`.
+    Case-insensitive.  Safely escapes markup chars before injecting tags.
+    """
+    escaped = _esc_markup(raw)
+    if not term:
+        return f"[{base}]{escaped}[/{base}]"
+
+    lo_raw  = raw.lower()
+    lo_term = term.lower()
+    idx     = lo_raw.find(lo_term)
+    if idx == -1:
+        return f"[{base}]{escaped}[/{base}]"
+
+    before = _esc_markup(raw[:idx])
+    match  = _esc_markup(raw[idx : idx + len(term)])
+    after  = _esc_markup(raw[idx + len(term):])
+    return (f"[{base}]{before}[/{base}]"
+            f"[black on bright_yellow]{match}[/black on bright_yellow]"
+            f"[{base}]{after}[/{base}]")
+
+
+def _fmt_kb(kb: int) -> str:
+    if kb >= 1_048_576: return f"{kb / 1_048_576:.1f}G"
+    if kb >= 1_024:     return f"{kb / 1_024:.0f}M"
+    return f"{kb}K"
+
+
+def _trigger_refilter_resort():
+    """
+    Re-run the full filter → sort pipeline using the current global state.
+    Must be called WITHOUT holding _lock (it acquires it internally).
+    Used whenever filter_text or sort_key/sort_reverse changes outside the
+    ingest path.
+    """
+    with _lock:
+        rp   = list(raw_processes)
+        ft   = filter_text
+    _safe_put(_filter_q, (rp, ft))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SORT KEY CONFIG
+# Defines the mapping from keypress → (field_name, default_descending)
+# ─────────────────────────────────────────────────────────────────────────────
+SORT_KEYS = {
+    "1": ("cpu_pct",   True),
+    "2": ("mem_pct",   True),
+    "3": ("pid",       False),
+    "4": ("priority",  False),
+    "5": ("nice",      False),
+    "6": ("virt_kb",   True),
+    "7": ("res_kb",    True),
+    "8": ("shr_kb",    True),
+}
+
+# Human-readable labels shown in the column header
+SORT_LABELS = {
+    "cpu_pct":  "CPU%",
+    "mem_pct":  "MEM%",
+    "pid":      "PID",
+    "priority": "PRI",
+    "nice":     "NI",
+    "virt_kb":  "VIRT",
+    "res_kb":   "RES",
+    "shr_kb":   "SHR",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKER THREADS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ingest_worker():
+    global raw_processes, system_metrics
+    for line in _pipe_file:
+        if stop_event.is_set():
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pkt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        with _lock:
+            system_metrics = pkt
+            raw_processes  = pkt.get("processes", [])
+            ft = filter_text
+        _safe_put(_filter_q, (list(raw_processes), ft))
+
+
+def _filter_worker():
+    """
+    FIX: always re-read sort_key / sort_reverse from globals at the moment
+    we forward to the sort queue, so a sort change that arrives while a
+    filter job is queued is never silently dropped.
+    """
+    global filtered_procs
+    while not stop_event.is_set():
+        try:
+            procs, ft = _filter_q.get(timeout=0.15)
+        except queue.Empty:
+            continue
+        if ft:
+            lo = ft.lower()
+            result = [p for p in procs
+                      if lo in p.get("cmd",  "").lower()
+                      or lo in p.get("user", "").lower()
+                      or lo in p.get("name", "").lower()]
+        else:
+            result = procs
+        # FIX: snapshot sort state HERE (after filtering) so we always use
+        # the latest sort_key/sort_reverse, not whatever was current when
+        # the filter job was enqueued.
+        with _lock:
+            filtered_procs = result
+            sk = sort_key
+            sr = sort_reverse
+        _safe_put(_sort_q, (list(result), sk, sr))
+        _filter_q.task_done()
+
+
+def _sort_worker():
+    global sorted_procs, scroll_offset
+    while not stop_event.is_set():
+        try:
+            procs, sk, sr = _sort_q.get(timeout=0.15)
+        except queue.Empty:
+            continue
+        try:
+            result = sorted(procs, key=lambda x: x.get(sk, 0), reverse=sr)
+        except Exception:
+            result = procs
+        with _lock:
+            sorted_procs = result
+            total        = len(result)
+        # Re-clamp and write back to global under lock
+        visible       = _visible_rows()
+        new_off       = _clamp_offset(scroll_offset, total, visible)
+        scroll_offset = new_off
+        _sort_q.task_done()
+
+
+def _keyboard_worker():
+    while not stop_event.is_set():
+        try:
+            ch = readchar.readkey()
+            _key_q.put(ch)
+        except (KeyboardInterrupt, EOFError, OSError):
+            _key_q.put(None)
+            break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEY HANDLER  — returns False to quit
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_key(ch: str) -> bool:
+    global sort_key, sort_reverse, filter_text, search_text
+    global ui_mode, input_buffer, scroll_offset
+
+    # ── text-input sub-modes ─────────────────────────────────────────────────
+    if ui_mode == "FILTER_INPUT":
+        if ch in (readchar.key.ENTER, "\r", "\n"):
+            # Apply the typed filter and kick off a fresh filter+sort pass
+            with _lock:
+                filter_text = input_buffer
+            input_buffer  = ""
+            scroll_offset = 0
+            ui_mode       = "NORMAL"
+            # FIX: trigger pipeline AFTER ui_mode is restored so the status
+            # bar updates atomically with the data refresh
+            _trigger_refilter_resort()
+
+        elif ch in (readchar.key.BACKSPACE, "\x7f"):
+            input_buffer = input_buffer[:-1]
+
+        elif ch == readchar.key.ESC:
+            # FIX: ESC in FILTER_INPUT cancels the edit — revert to whatever
+            # filter was active before and return to NORMAL mode cleanly.
+            # Do NOT clear filter_text here (that's what ESC in NORMAL does).
+            input_buffer = ""
+            ui_mode      = "NORMAL"
+
+        elif len(ch) == 1 and ch.isprintable():
+            input_buffer += ch
+        return True
+
+    if ui_mode == "SEARCH_INPUT":
+        if ch in (readchar.key.ENTER, "\r", "\n"):
+            with _lock:
+                search_text = input_buffer
+            input_buffer = ""
+            ui_mode      = "NORMAL"
+
+        elif ch in (readchar.key.BACKSPACE, "\x7f"):
+            input_buffer = input_buffer[:-1]
+
+        elif ch == readchar.key.ESC:
+            # FIX: same as FILTER_INPUT — cancel the edit, restore NORMAL mode,
+            # leave search_text unchanged (ESC in NORMAL clears it).
+            input_buffer = ""
+            ui_mode      = "NORMAL"
+
+        elif len(ch) == 1 and ch.isprintable():
+            input_buffer += ch
+        return True
+
+    # ── normal mode ──────────────────────────────────────────────────────────
+    if ch in ("q", "Q", readchar.key.CTRL_C):
+        return False
+
+    # ── scrolling ─────────────────────────────────────────────────────────────
+    elif ch == readchar.key.DOWN:
+        _set_scroll(scroll_offset + 1)
+
+    elif ch == readchar.key.UP:
+        _set_scroll(scroll_offset - 1)
+
+    elif ch == readchar.key.PAGE_DOWN:
+        _set_scroll(scroll_offset + _visible_rows())
+
+    elif ch == readchar.key.PAGE_UP:
+        _set_scroll(scroll_offset - _visible_rows())
+
+    elif ch == readchar.key.HOME:
+        scroll_offset = 0
+
+    elif ch == readchar.key.END:
+        with _lock:
+            total = len(sorted_procs)
+        _set_scroll(total)
+
+    # ── sorting ───────────────────────────────────────────────────────────────
+    elif ch in SORT_KEYS:
+        field, default_desc = SORT_KEYS[ch]
+        with _lock:
+            if sort_key == field:
+                sort_reverse = not sort_reverse
+            else:
+                sort_key, sort_reverse = field, default_desc
+            # FIX: sort directly from filtered_procs (already filtered list)
+            # so we don't re-run the filter pass unnecessarily.
+            snap = list(filtered_procs)
+            sk, sr = sort_key, sort_reverse
+        scroll_offset = 0
+        _safe_put(_sort_q, (snap, sk, sr))
+
+    # ── filter / search ───────────────────────────────────────────────────────
+    elif ch == "/":
+        # Pre-populate the buffer with the current filter so the user can
+        # edit rather than retype it.
+        with _lock:
+            current_ft = filter_text
+        input_buffer = current_ft
+        ui_mode      = "FILTER_INPUT"
+
+    elif ch in ("s", "S"):
+        with _lock:
+            current_st = search_text
+        input_buffer = current_st
+        ui_mode      = "SEARCH_INPUT"
+
+    elif ch == readchar.key.ESC:
+        # ESC in NORMAL mode clears both filter and search, then re-runs
+        # the full pipeline so the table immediately shows all processes.
+        with _lock:
+            filter_text = ""
+            search_text = ""
+        scroll_offset = 0
+        _trigger_refilter_resort()
+
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DASHBOARD RENDERER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_dashboard() -> Layout:
+    with _lock:
+        metrics = system_metrics
+        procs   = list(sorted_procs)
+        total_f = len(filtered_procs)
+        sk      = sort_key
+        sr      = sort_reverse
+        ft      = filter_text
+        st      = search_text
+        mode    = ui_mode
+        buf     = input_buffer
+        offset  = scroll_offset
+
+    visible = _visible_rows()
+    offset  = _clamp_offset(offset, len(procs), visible)
+
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="top",    size=17),
+        Layout(name="bottom"),
+    )
+    layout["top"].split_row(
+        Layout(name="system", ratio=1),
+        Layout(name="cpu",    ratio=1),
+        Layout(name="memory", ratio=1),
+    )
+
+    # ── HEADER ───────────────────────────────────────────────────────────────
+    sort_hint = f"[dim]sort:[/dim] [bold cyan]{SORT_LABELS.get(sk, sk)} {'▼' if sr else '▲'}[/bold cyan]"
+    layout["header"].update(
+        Panel(
+            Text.from_markup(
+                f"[bold white]MyTop  |  System Resource Monitor[/bold white]"
+                f"   {sort_hint}",
+                justify="center",
+            ),
+            border_style="bright_cyan",
+        )
+    )
+
+    if not metrics:
+        layout["bottom"].update(
+            Panel(Text("Waiting for data from collector…",
+                       justify="center", style="yellow"))
+        )
+        return layout
+
+    # ── SYSTEM ───────────────────────────────────────────────────────────────
+    up    = int(metrics.get("uptime", 0))
+    load  = metrics.get("load", [0.0, 0.0, 0.0])
+    tasks = metrics.get("tasks", {"total": 0, "running": 0, "threads": 0})
+    sys_txt = (
+        f"[bold cyan]Load Average[/bold cyan]\n"
+        f"{load[0]:.2f}    {load[1]:.2f}    {load[2]:.2f}\n\n"
+        f"[green]Tasks[/green]      : {tasks['total']}\n"
+        f"[yellow]Running[/yellow]    : {tasks['running']}\n"
+        f"[magenta]Threads[/magenta]    : {tasks['threads']}\n\n"
+        f"[cyan]Uptime[/cyan]\n"
+        f"{up//86400}d {(up%86400)//3600}h {(up%3600)//60}m"
+    )
+    layout["system"].update(
+        Panel(sys_txt, title="SYSTEM", border_style="cyan", title_align="center")
+    )
+
+    # ── CPU ──────────────────────────────────────────────────────────────────
+    cpu_total = metrics.get("cpu_total", 0.0)
+    cpu_txt = (
+        f"[bold green]Total CPU[/bold green]\n"
+        f"{_bar(cpu_total, 24)}\n"
+        f"[bold]{cpu_total:.1f}%[/bold]\n\n"
+    )
+    for i, v in enumerate(metrics.get("cpu_cores", [])[:12]):
+        c = "green" if v < 50 else ("yellow" if v < 80 else "red")
+        cpu_txt += f"[{c}]CPU{i:02d}[/{c}]   {v:5.1f}%\n"
+    layout["cpu"].update(
+        Panel(cpu_txt, title="CPU", border_style="green", title_align="center")
+    )
+
+    # ── MEMORY ───────────────────────────────────────────────────────────────
+    mem  = metrics.get("memory", {
+        "total_kb": 1, "used_kb": 0, "free_kb": 0,
+        "available_kb": 0, "cached_kb": 0, "buffers_kb": 0,
+    })
+    swap = metrics.get("swap", {"total_kb": 0, "used_kb": 0, "free_kb": 0})
+    mem_pct = (mem["used_kb"] / mem["total_kb"] * 100) if mem["total_kb"] else 0.0
+    mem_txt = (
+        f"[bold magenta]Memory Usage[/bold magenta]\n"
+        f"{_bar(mem_pct, 24)}\n"
+        f"[bold]{mem_pct:.1f}%[/bold]\n\n"
+        f"[green]Used[/green]       : {mem['used_kb']//1024} MB\n"
+        f"[red]Free[/red]       : {mem['free_kb']//1024} MB\n"
+        f"[cyan]Available[/cyan]  : {mem['available_kb']//1024} MB\n"
+        f"[yellow]Cached[/yellow]     : {mem['cached_kb']//1024} MB\n"
+        f"[magenta]Buffers[/magenta]    : {mem['buffers_kb']//1024} MB\n\n"
+        f"[green]Swap Used[/green]  : {swap['used_kb']//1024} MB\n"
+        f"[red]Swap Free[/red]  : {swap['free_kb']//1024} MB\n"
+        f"[cyan]Swap Total[/cyan] : {swap['total_kb']//1024} MB"
+    )
+    layout["memory"].update(
+        Panel(mem_txt, title="MEMORY", border_style="magenta", title_align="center")
+    )
+
+    # ── PROCESS TABLE ────────────────────────────────────────────────────────
+    def _col(label: str, key: str) -> str:
+        if sk == key:
+            arrow = "▼" if sr else "▲"
+            return f"[bold bright_white]{label} {arrow}[/bold bright_white]"
+        return label
+
+    total_procs = len(procs)
+    end_row     = min(offset + visible, total_procs)
+    start_row   = (offset + 1) if total_procs else 0
+    if total_procs > visible:
+        scroll_pct = int(offset / max(1, total_procs - visible) * 100)
+    else:
+        scroll_pct = 100
+
+    title_str = (
+        f"PROCESSES  [dim]{start_row}–{end_row} of {total_procs}"
+        + (f"  ({total_f} matched)" if ft else "")
+        + f"  {scroll_pct}%[/dim]"
+        + (f"  [yellow]filter: {_esc_markup(ft)}[/yellow]" if ft else "")
+        + (f"  [bright_yellow]search: {_esc_markup(st)}[/bright_yellow]" if st else "")
+    )
+
+    table = Table(
+        title=title_str,
+        expand=True,
+        show_lines=False,
+        header_style="bold bright_cyan",
+        title_style="italic white",
+    )
+    table.add_column(_col("PID",   "pid"),      style="cyan",          width=7,  justify="right")
+    table.add_column("USER",                    style="green",         width=10, justify="left")
+    table.add_column(_col("CPU%",  "cpu_pct"),  style="red",           width=7,  justify="right")
+    table.add_column(_col("MEM%",  "mem_pct"),  style="yellow",        width=7,  justify="right")
+    table.add_column(_col("PRI",   "priority"), style="bright_yellow", width=4,  justify="right")
+    table.add_column(_col("NI",    "nice"),      style="bright_yellow", width=4,  justify="right")
+    table.add_column(_col("VIRT",  "virt_kb"),  style="magenta",       width=7,  justify="right")
+    table.add_column(_col("RES",   "res_kb"),   style="red",           width=7,  justify="right")
+    table.add_column(_col("SHR",   "shr_kb"),   style="bright_blue",   width=7,  justify="right")
+    table.add_column("S",                       style="white",         width=3,  justify="left")
+    table.add_column("THR",                     style="bright_blue",   width=4,  justify="right")
+    table.add_column("COMMAND",                 style="white",                   justify="left")
+
+    STATE_COLOR = {"R": "green", "S": "cyan", "D": "red", "Z": "magenta"}
+    page = procs[offset : offset + visible]
+    for p in page:
+        sc = STATE_COLOR.get(p.get("state", "?"), "white")
+        table.add_row(
+            _highlight(str(p.get("pid", "")),             st, "cyan"),
+            _highlight(p.get("user", ""),                 st, "green"),
+            _highlight(f"{p.get('cpu_pct', 0):.1f}",      st, "red"),
+            _highlight(f"{p.get('mem_pct', 0):.1f}",      st, "yellow"),
+            f"[bright_yellow]{p.get('priority', 0)}[/bright_yellow]",
+            f"[bright_yellow]{p.get('nice', 0)}[/bright_yellow]",
+            f"[magenta]{_fmt_kb(p.get('virt_kb', 0))}[/magenta]",
+            f"[red]{_fmt_kb(p.get('res_kb', 0))}[/red]",
+            f"[bright_blue]{_fmt_kb(p.get('shr_kb', 0))}[/bright_blue]",
+            f"[{sc}]{p.get('state', '?')}[/{sc}]",
+            f"[bright_blue]{p.get('threads', 1)}[/bright_blue]",
+            _highlight(p.get("cmd", "")[:60],             st, "white"),
+        )
+
+    # ── STATUS BAR ───────────────────────────────────────────────────────────
+    if mode == "FILTER_INPUT":
+        status = (
+            f"[bold black on yellow] FILTER [/bold black on yellow] "
+            f"[bold white]{_esc_markup(buf)}█[/bold white]"
+            f"   [dim]ENTER=apply  ESC=cancel[/dim]"
+        )
+    elif mode == "SEARCH_INPUT":
+        status = (
+            f"[bold black on bright_yellow] SEARCH [/bold black on bright_yellow] "
+            f"[bold white]{_esc_markup(buf)}█[/bold white]"
+            f"   [dim]ENTER=apply  ESC=cancel[/dim]"
+        )
+    else:
+        status = (
+            "[dim]↑↓/PgUp/PgDn/Home/End[/dim]=scroll  "
+            "[cyan]1[/cyan]=CPU  [cyan]2[/cyan]=MEM  [cyan]3[/cyan]=PID  "
+            "[cyan]4[/cyan]=PRI  [cyan]5[/cyan]=NI  [cyan]6[/cyan]=VIRT  "
+            "[cyan]7[/cyan]=RES  [cyan]8[/cyan]=SHR  "
+            "[cyan]/[/cyan]=filter  [cyan]S[/cyan]=search  "
+            "[cyan]ESC[/cyan]=clear  [cyan]Q[/cyan]=quit"
+        )
+
+    layout["bottom"].split_column(
+        Layout(table, ratio=1),
+        Layout(
+            Panel(Text.from_markup(status), border_style="grey37"),
+            size=3,
+        ),
+    )
+    return layout
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    sys.stdin = open("/dev/tty", "r")
+
+    for target, name in [
+        (_ingest_worker,   "Ingest"),
+        (_filter_worker,   "Filter"),
+        (_sort_worker,     "Sort"),
+        (_keyboard_worker, "Keys"),
+    ]:
+        threading.Thread(target=target, daemon=True, name=name).start()
+
+    with Live(
+        _build_dashboard(),
+        console=console,
+        refresh_per_second=8,
+        screen=True,
+    ) as live:
+        while not stop_event.is_set():
+            try:
+                while True:
+                    ch = _key_q.get_nowait()
+                    if ch is None:
+                        stop_event.set()
+                        break
+                    if not _handle_key(ch):
+                        stop_event.set()
+                        break
+            except queue.Empty:
+                pass
+
+            live.update(_build_dashboard())
+            time.sleep(0.1)
+
+    stop_event.set()
+
+
+if __name__ == "__main__":
+    main()
